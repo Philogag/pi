@@ -181,6 +181,8 @@ Rendering runs on the interactive path. Cache expensive layout and highlighting 
 
 Keep the default view compact and reveal detail through expansion or a dedicated screen. For custom tool rendering, handle partial results and reuse the previous component when it can be updated safely.
 
+Long transcripts use `WindowedContainer` for the chat area: each message is an entry with a `build()` factory, and only entries inside the visible window keep a live component. The conversation itself stays addressable (search, selection, scroll height) because every entry keeps its measured height and its rendered lines. Finished entries can still be updated after eviction by replacing `entry.build`; pin rows that are still streaming.
+
 Use `PI_TUI_WRITE_LOG` to capture the raw ANSI stream when diagnosing rendering problems. Test narrow widths, wide characters, resize events, theme changes, focus transitions, and both regular and fullscreen modes.
 
 ## Examples and source

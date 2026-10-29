@@ -51,6 +51,8 @@ import {
 	type TuiMouseEvent,
 	type TuiMouseEventResult,
 	visibleWidth,
+	WindowedContainer,
+	type WindowedEntry,
 } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { spawn } from "child_process";
@@ -457,13 +459,22 @@ interface ExtensionChangelogUpdate {
 	markdown: string;
 }
 
+type ToolExecutionResult = Parameters<ToolExecutionComponent["updateResult"]>[0];
+
+interface ToolExecutionState {
+	args: unknown;
+	argsComplete: boolean;
+	result?: ToolExecutionResult;
+	isPartial: boolean;
+}
+
 export class InteractiveMode {
 	private runtimeHost: AgentSessionRuntime;
 	private renderer: TuiMainScreen | TuiAltScreen;
 	private ui: TUI;
 	private mainScreenRenderState: TuiMainScreenRenderState | undefined;
 	private loadedResourcesContainer: Container;
-	private chatContainer: Container;
+	private chatContainer: WindowedContainer;
 	private documentContainer: Container;
 	private transcriptScrollView: TuiLayouts.ScrollView | undefined;
 	private fullscreenLayoutRoot: Component | undefined;
@@ -512,6 +523,9 @@ export class InteractiveMode {
 
 	// Streaming message tracking
 	private streamingComponent: AssistantMessageComponent | undefined = undefined;
+	private streamingEntry: WindowedEntry | undefined = undefined;
+	/** Replay state for tool rows, so an evicted row rebuilds with its args and result. */
+	private readonly toolStates = new WeakMap<ToolExecutionComponent, ToolExecutionState>();
 	private readonly entriesRenderedByBoundaryCompaction = new Set<string>();
 	private streamingMessage: AssistantMessage | undefined = undefined;
 
@@ -642,7 +656,18 @@ export class InteractiveMode {
 		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
 		this.headerContainer = new Container();
 		this.loadedResourcesContainer = new Container();
-		this.chatContainer = new Container();
+		this.chatContainer = new WindowedContainer({
+			getViewport: () =>
+				this.renderer.mode === "fullscreen" && this.transcriptScrollView
+					? { top: this.transcriptScrollView.scrollTop, height: this.transcriptScrollView.viewportHeight }
+					: undefined,
+			windowFromEnd: true,
+			getViewportLines: () => this.ui.terminal.rows,
+			overscan: 1,
+			// The alternate screen clips and diffs per row, so evicted rows may collapse to blank lines.
+			// The regular screen diffs the whole line buffer and needs the real history lines.
+			retainLines: true,
+		});
 		this.documentContainer = new Container();
 		this.documentContainer.addChild(this.headerContainer);
 		this.documentContainer.addChild(this.loadedResourcesContainer);
@@ -860,7 +885,7 @@ export class InteractiveMode {
 			return;
 		}
 
-		if (this.chatContainer.children.length > 0) {
+		if (this.chatContainer.entryCount > 0) {
 			this.chatContainer.addChild(new Spacer(1));
 		}
 		this.chatContainer.addChild(new DynamicBorder());
@@ -2322,6 +2347,7 @@ export class InteractiveMode {
 		this.pendingMessagesContainer.clear();
 		this.compactionQueuedMessages = [];
 		this.streamingComponent = undefined;
+		this.streamingEntry = undefined;
 		this.streamingMessage = undefined;
 		this.pendingTools.clear();
 		this.renderInitialMessages();
@@ -3575,6 +3601,7 @@ export class InteractiveMode {
 					this.updatePendingMessagesDisplay();
 					this.ui.requestRender();
 				} else if (event.message.role === "assistant") {
+					const streamingMessage = event.message;
 					this.streamingComponent = new AssistantMessageComponent(
 						undefined,
 						this.hideThinkingBlock,
@@ -3583,8 +3610,20 @@ export class InteractiveMode {
 						this.outputPad,
 						this.getMarkdownTransformers(),
 					);
-					this.streamingMessage = event.message;
-					this.chatContainer.addChild(this.streamingComponent);
+					this.streamingMessage = streamingMessage;
+					this.streamingEntry = this.chatContainer.append(
+						() =>
+							new AssistantMessageComponent(
+								streamingMessage,
+								this.hideThinkingBlock,
+								this.getMarkdownThemeWithSettings(),
+								this.hiddenThinkingLabel,
+								this.outputPad,
+								this.getMarkdownTransformers(),
+							),
+						{ pinned: true },
+					);
+					this.streamingEntry.component = this.streamingComponent;
 					this.streamingComponent.updateContent(this.streamingMessage, true);
 					this.ui.requestRender();
 				}
@@ -3598,26 +3637,12 @@ export class InteractiveMode {
 					for (const content of this.streamingMessage.content) {
 						if (content.type === "toolCall") {
 							if (!this.pendingTools.has(content.id)) {
-								const component = new ToolExecutionComponent(
-									content.name,
-									content.id,
-									content.arguments,
-									{
-										showImages: this.settingsManager.getShowImages(),
-										imageWidthCells: this.settingsManager.getImageWidthCells(),
-										outputPad: this.outputPad,
-									},
-									this.getRegisteredToolDefinition(content.name),
-									this.ui,
-									this.sessionManager.getCwd(),
-								);
-								component.setExpanded(this.toolOutputExpanded);
-								this.chatContainer.addChild(component);
+								const component = this.createToolExecution(content.name, content.id, content.arguments);
 								this.pendingTools.set(content.id, component);
 							} else {
 								const component = this.pendingTools.get(content.id);
 								if (component) {
-									component.updateArgs(content.arguments);
+									this.updateToolArgs(component, content.arguments);
 								}
 							}
 						}
@@ -3640,13 +3665,26 @@ export class InteractiveMode {
 						this.streamingMessage.errorMessage = errorMessage;
 					}
 					this.streamingComponent.updateContent(this.streamingMessage, false);
+					const finalMessage = this.streamingMessage;
+					if (this.streamingEntry) {
+						this.streamingEntry.build = () =>
+							new AssistantMessageComponent(
+								finalMessage,
+								this.hideThinkingBlock,
+								this.getMarkdownThemeWithSettings(),
+								this.hiddenThinkingLabel,
+								this.outputPad,
+								this.getMarkdownTransformers(),
+							);
+						this.streamingEntry.pinned = false;
+					}
 
 					if (this.streamingMessage.stopReason === "aborted" || this.streamingMessage.stopReason === "error") {
 						if (!errorMessage) {
 							errorMessage = this.streamingMessage.errorMessage || "Error";
 						}
 						for (const [, component] of this.pendingTools.entries()) {
-							component.updateResult({
+							this.updateToolResult(component, {
 								content: [{ type: "text", text: errorMessage }],
 								isError: true,
 							});
@@ -3656,12 +3694,13 @@ export class InteractiveMode {
 					} else {
 						// Args are now complete - trigger diff computation for edit tools
 						for (const [, component] of this.pendingTools.entries()) {
-							component.setArgsComplete();
+							this.setToolArgsComplete(component);
 						}
 						this.maybeShowThinkingDropNotice(this.streamingMessage);
 						this.maybeShowCacheMissNotice(this.streamingMessage);
 					}
 					this.streamingComponent = undefined;
+					this.streamingEntry = undefined;
 					this.streamingMessage = undefined;
 					this.footer.invalidate();
 				}
@@ -3677,21 +3716,7 @@ export class InteractiveMode {
 				if (event.parentToolCallId) break;
 				let component = this.pendingTools.get(event.toolCallId);
 				if (!component) {
-					component = new ToolExecutionComponent(
-						event.toolName,
-						event.toolCallId,
-						event.args,
-						{
-							showImages: this.settingsManager.getShowImages(),
-							imageWidthCells: this.settingsManager.getImageWidthCells(),
-							outputPad: this.outputPad,
-						},
-						this.getRegisteredToolDefinition(event.toolName),
-						this.ui,
-						this.sessionManager.getCwd(),
-					);
-					component.setExpanded(this.toolOutputExpanded);
-					this.chatContainer.addChild(component);
+					component = this.createToolExecution(event.toolName, event.toolCallId, event.args);
 					this.pendingTools.set(event.toolCallId, component);
 				}
 				component.markExecutionStarted();
@@ -3702,7 +3727,7 @@ export class InteractiveMode {
 			case "tool_execution_update": {
 				const component = this.pendingTools.get(event.toolCallId);
 				if (component) {
-					component.updateResult({ ...event.partialResult, isError: false }, true);
+					this.updateToolResult(component, { ...event.partialResult, isError: false }, true);
 					this.ui.requestRender();
 				}
 				break;
@@ -3712,7 +3737,11 @@ export class InteractiveMode {
 				if (event.isError) this.maybeShowInstallChangeWarning();
 				const component = this.pendingTools.get(event.toolCallId);
 				if (component) {
-					component.updateResult({ ...event.result, isError: event.isError, durationMs: event.durationMs });
+					this.updateToolResult(component, {
+						...event.result,
+						isError: event.isError,
+						durationMs: event.durationMs,
+					});
 					this.pendingTools.delete(event.toolCallId);
 					this.ui.requestRender();
 				}
@@ -3724,8 +3753,9 @@ export class InteractiveMode {
 					this.ui.terminal.setProgress(false);
 				}
 				this.clearStatusIndicator("working");
-				if (this.streamingComponent) {
-					this.chatContainer.removeChild(this.streamingComponent);
+				if (this.streamingEntry) {
+					this.chatContainer.removeEntry(this.streamingEntry);
+					this.streamingEntry = undefined;
 					this.streamingComponent = undefined;
 					this.streamingMessage = undefined;
 				}
@@ -3929,26 +3959,42 @@ export class InteractiveMode {
 		if (!renderer) {
 			return;
 		}
-		const component = new CustomEntryComponent(entry, renderer, this.outputPad);
-		component.setExpanded(this.toolOutputExpanded);
-		if (!component.hasContent()) {
+		const build = (): Component => {
+			const component = new CustomEntryComponent(entry, renderer, this.outputPad);
+			component.setExpanded(this.toolOutputExpanded);
+			return component;
+		};
+		// Custom entries are inserted above the streaming row so the live answer stays last.
+		if (this.streamingEntry) {
+			this.chatContainer.insertBeforeEntry(this.streamingEntry, build);
 			return;
 		}
-
-		if (this.streamingComponent) {
-			const streamingIndex = this.chatContainer.children.indexOf(this.streamingComponent);
-			if (streamingIndex >= 0) {
-				this.chatContainer.children.splice(streamingIndex, 0, component);
-				return;
-			}
-		}
-
-		this.chatContainer.addChild(component);
+		this.chatContainer.append(build);
 	}
 
 	private addMessageToChat(
 		message: AgentMessage,
 		options?: { populateHistory?: boolean; messageId?: string; timestamp?: string },
+	): void {
+		if (message.role === "system" || message.role === "toolResult") return;
+		if (message.role === "custom" && !message.display) return;
+		const textContent = message.role === "user" ? this.getUserMessageText(message) : undefined;
+		if (message.role === "user" && !textContent) return;
+		if (textContent && options?.populateHistory) this.editor.addToHistory?.(textContent);
+		const spacer = message.role === "user" && this.chatContainer.entryCount > 0;
+		this.chatContainer.append(() => {
+			const container = new Container();
+			if (spacer) container.addChild(new Spacer(1));
+			this.buildMessageToChat(container, message, textContent, options);
+			return container;
+		});
+	}
+
+	private buildMessageToChat(
+		container: Container,
+		message: AgentMessage,
+		textContent: string | undefined,
+		options?: { messageId?: string; timestamp?: string },
 	): void {
 		switch (message.role) {
 			case "bashExecution": {
@@ -3967,90 +4013,82 @@ export class InteractiveMode {
 					message.truncated ? ({ truncated: true } as TruncationResult) : undefined,
 					message.fullOutputPath,
 				);
-				this.chatContainer.addChild(component);
+				container.addChild(component);
 				break;
 			}
 			case "custom": {
-				if (message.display) {
-					const renderer = this.session.extensionRunner.getMessageRenderer(message.customType);
-					const component = new CustomMessageComponent(
-						message,
-						renderer,
-						this.getMarkdownThemeWithSettings(),
-						this.outputPad,
-					);
-					component.setExpanded(this.toolOutputExpanded);
-					this.chatContainer.addChild(component);
-				}
+				if (!message.display) break;
+				const renderer = this.session.extensionRunner.getMessageRenderer(message.customType);
+				const component = new CustomMessageComponent(
+					message,
+					renderer,
+					this.getMarkdownThemeWithSettings(),
+					this.outputPad,
+				);
+				component.setExpanded(this.toolOutputExpanded);
+				container.addChild(component);
 				break;
 			}
 			case "compactionSummary": {
-				this.chatContainer.addChild(new Spacer(1));
+				container.addChild(new Spacer(1));
 				const component = new CompactionSummaryMessageComponent(
 					message,
 					this.getMarkdownThemeWithSettings(),
 					this.outputPad,
 				);
 				component.setExpanded(this.toolOutputExpanded);
-				this.chatContainer.addChild(component);
+				container.addChild(component);
 				break;
 			}
 			case "branchSummary": {
-				this.chatContainer.addChild(new Spacer(1));
+				container.addChild(new Spacer(1));
 				const component = new BranchSummaryMessageComponent(
 					message,
 					this.getMarkdownThemeWithSettings(),
 					this.outputPad,
 				);
 				component.setExpanded(this.toolOutputExpanded);
-				this.chatContainer.addChild(component);
+				container.addChild(component);
 				break;
 			}
 			case "system":
+			case "toolResult":
 				break;
 			case "user": {
-				const textContent = this.getUserMessageText(message);
-				if (textContent) {
-					if (this.chatContainer.children.length > 0) {
-						this.chatContainer.addChild(new Spacer(1));
-					}
-					const skillBlock = parseSkillBlock(textContent);
-					if (skillBlock) {
-						// Render skill block (collapsible)
-						const component = new SkillInvocationMessageComponent(
-							skillBlock,
-							this.getMarkdownThemeWithSettings(),
-							this.outputPad,
-						);
-						component.setExpanded(this.toolOutputExpanded);
-						this.chatContainer.addChild(component);
-						// Render user message separately if present
-						if (skillBlock.userMessage) {
-							this.chatContainer.addChild(new Spacer(1));
-							const userComponent = new UserMessageComponent(
-								skillBlock.userMessage,
-								this.getMarkdownThemeWithSettings(),
-								this.outputPad,
-								this.getMarkdownTransformers(),
-								options?.messageId,
-								options?.timestamp,
-							);
-							this.chatContainer.addChild(userComponent);
-						}
-					} else {
+				if (!textContent) break;
+				const skillBlock = parseSkillBlock(textContent);
+				if (skillBlock) {
+					// Render skill block (collapsible)
+					const component = new SkillInvocationMessageComponent(
+						skillBlock,
+						this.getMarkdownThemeWithSettings(),
+						this.outputPad,
+					);
+					component.setExpanded(this.toolOutputExpanded);
+					container.addChild(component);
+					// Render user message separately if present
+					if (skillBlock.userMessage) {
+						container.addChild(new Spacer(1));
 						const userComponent = new UserMessageComponent(
-							textContent,
+							skillBlock.userMessage,
 							this.getMarkdownThemeWithSettings(),
 							this.outputPad,
 							this.getMarkdownTransformers(),
 							options?.messageId,
 							options?.timestamp,
 						);
-						this.chatContainer.addChild(userComponent);
+						container.addChild(userComponent);
 					}
-					if (options?.populateHistory) {
-						this.editor.addToHistory?.(textContent);
-					}
+				} else {
+					const userComponent = new UserMessageComponent(
+						textContent,
+						this.getMarkdownThemeWithSettings(),
+						this.outputPad,
+						this.getMarkdownTransformers(),
+						options?.messageId,
+						options?.timestamp,
+					);
+					container.addChild(userComponent);
 				}
 				break;
 			}
@@ -4065,17 +4103,66 @@ export class InteractiveMode {
 					options?.messageId,
 					options?.timestamp,
 				);
-				this.chatContainer.addChild(assistantComponent);
-				break;
-			}
-			case "toolResult": {
-				// Tool results are rendered inline with tool calls, handled separately
+				container.addChild(assistantComponent);
 				break;
 			}
 			default: {
 				const _exhaustive: never = message;
 			}
 		}
+	}
+
+	/** Append a tool row that rebuilds from its args and result when it re-enters the window. */
+	private createToolExecution(name: string, id: string, args: unknown): ToolExecutionComponent {
+		const state: ToolExecutionState = { args, argsComplete: false, isPartial: false };
+		const build = (): ToolExecutionComponent => {
+			const component = new ToolExecutionComponent(
+				name,
+				id,
+				state.args,
+				{
+					showImages: this.settingsManager.getShowImages(),
+					imageWidthCells: this.settingsManager.getImageWidthCells(),
+					outputPad: this.outputPad,
+				},
+				this.getRegisteredToolDefinition(name),
+				this.ui,
+				this.sessionManager.getCwd(),
+			);
+			component.setExpanded(this.toolOutputExpanded);
+			if (state.argsComplete) component.setArgsComplete();
+			if (state.result) component.updateResult(state.result, state.isPartial);
+			return component;
+		};
+		const entry = this.chatContainer.append(build, { pinned: true });
+		const component = build();
+		entry.component = component;
+		this.toolStates.set(component, state);
+		return component;
+	}
+
+	private updateToolArgs(component: ToolExecutionComponent, args: unknown): void {
+		const state = this.toolStates.get(component);
+		if (state) state.args = args;
+		component.updateArgs(args);
+	}
+
+	private setToolArgsComplete(component: ToolExecutionComponent): void {
+		const state = this.toolStates.get(component);
+		if (state) state.argsComplete = true;
+		component.setArgsComplete();
+	}
+
+	private updateToolResult(component: ToolExecutionComponent, result: ToolExecutionResult, isPartial = false): void {
+		const state = this.toolStates.get(component);
+		if (state) {
+			state.result = result;
+			state.isPartial = isPartial;
+		}
+		component.updateResult(result, isPartial);
+		// A finished row can leave the window; only in-flight rows must stay materialized.
+		const entry = isPartial ? undefined : this.chatContainer.entryOf(component);
+		if (entry) entry.pinned = false;
 	}
 
 	private renderSessionItems(
@@ -4121,21 +4208,7 @@ export class InteractiveMode {
 				// Render tool call components
 				for (const content of message.content) {
 					if (content.type === "toolCall") {
-						const component = new ToolExecutionComponent(
-							content.name,
-							content.id,
-							content.arguments,
-							{
-								showImages: this.settingsManager.getShowImages(),
-								imageWidthCells: this.settingsManager.getImageWidthCells(),
-								outputPad: this.outputPad,
-							},
-							this.getRegisteredToolDefinition(content.name),
-							this.ui,
-							this.sessionManager.getCwd(),
-						);
-						component.setExpanded(this.toolOutputExpanded);
-						this.chatContainer.addChild(component);
+						const component = this.createToolExecution(content.name, content.id, content.arguments);
 
 						if (message.stopReason === "aborted" || message.stopReason === "error") {
 							let errorMessage: string;
@@ -4148,7 +4221,10 @@ export class InteractiveMode {
 							} else {
 								errorMessage = message.errorMessage || "Error";
 							}
-							component.updateResult({ content: [{ type: "text", text: errorMessage }], isError: true });
+							this.updateToolResult(component, {
+								content: [{ type: "text", text: errorMessage }],
+								isError: true,
+							});
 						} else {
 							renderedPendingTools.set(content.id, component);
 						}
@@ -4162,7 +4238,7 @@ export class InteractiveMode {
 				// Match tool results to pending tool components
 				const component = renderedPendingTools.get(message.toolCallId);
 				if (component) {
-					component.updateResult(message);
+					this.updateToolResult(component, message);
 					renderedPendingTools.delete(message.toolCallId);
 				}
 			} else {
@@ -4331,7 +4407,7 @@ export class InteractiveMode {
 			return;
 		}
 
-		if (this.chatContainer.children.length > 0) {
+		if (this.chatContainer.entryCount > 0) {
 			this.chatContainer.addChild(new Spacer(1));
 		}
 		this.chatContainer.addChild(

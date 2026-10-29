@@ -11,7 +11,7 @@ Minimal terminal UI framework with differential rendering and synchronized outpu
 - **Bracketed Paste Mode**: Handles large pastes correctly with markers for >10 line pastes
 - **Component-based**: Simple Component interface with render() method
 - **Theme Support**: Components accept theme interfaces for customizable styling
-- **Built-in Components**: Text, TruncatedText, Input, Editor, Markdown, Loader, SelectList, SettingsList, MouseRegion, Spacer, Image, Box, Container, VStack, HStack, ScrollView
+- **Built-in Components**: Text, TruncatedText, Input, Editor, Markdown, Loader, SelectList, SettingsList, MouseRegion, Spacer, Image, Box, Container, WindowedContainer, VStack, HStack, ScrollView
 - **Inline Images**: Renders images in terminals that support Kitty or iTerm2 graphics protocols
 - **Autocomplete Support**: File paths and slash commands
 
@@ -372,6 +372,24 @@ const container = new Container();
 container.addChild(component);
 container.removeChild(component);
 ```
+
+### WindowedContainer
+
+Groups entries and keeps only the components inside the visible window materialized. Use it for long scrolling content where a live component per row would dominate memory.
+
+```typescript
+const transcript = new WindowedContainer({
+  windowFromEnd: true,                     // regular screen: keep the tail materialized
+  getViewportLines: () => terminal.rows,   // screen height for that window
+  overscan: 1,                             // extra viewports above and below
+  retainLines: true,                       // keep rendered lines of released entries (needed for the regular-screen diff)
+});
+
+const entry = transcript.append(() => buildMessageRow(message));  // built on the next render
+entry.pinned = false;                                            // released once it leaves the window
+```
+
+Alternate-screen renderers can use `getViewport: () => ({ top, height })` instead of `windowFromEnd`, and `retainLines: false` to let released entries collapse to blank lines that the renderer clips. `entry.pinned` keeps a row alive (streaming rows); replace `entry.build` to change what a released entry rebuilds into.
 
 ### Box
 
