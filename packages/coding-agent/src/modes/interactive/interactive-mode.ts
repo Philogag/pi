@@ -657,6 +657,8 @@ export class InteractiveMode {
 		this.headerContainer = new Container();
 		this.loadedResourcesContainer = new Container();
 		this.chatContainer = new WindowedContainer({
+			// Only the alternate screen clips every line on write, so only it may skip measuring the transcript.
+			lazyResize: () => this.renderer.mode === "fullscreen",
 			getViewport: () =>
 				this.renderer.mode === "fullscreen" && this.transcriptScrollView
 					? { top: this.transcriptScrollView.scrollTop, height: this.transcriptScrollView.viewportHeight }

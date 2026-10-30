@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { ScrollView } from "../src/components/scroll-view.ts";
 import { Text } from "../src/components/text.ts";
-import { WindowedContainer } from "../src/components/windowed-container.ts";
+import {
+	WindowedContainer,
+	type WindowedContainerOptions,
+	type WindowedEntry,
+} from "../src/components/windowed-container.ts";
 import type { Component } from "../src/tui.ts";
 import { TuiAltScreen } from "../src/tui-alt-screen.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
@@ -140,28 +144,185 @@ test("windowFromEnd keeps only the tail window materialized", () => {
 	assert.equal(created[0]!.disposed, true);
 });
 
-test("width changes remeasure every entry and rerender the window", () => {
-	const top = 0;
-	const widths: number[] = [];
-	class WidthAware implements Component {
-		renders = 0;
-		readonly id: number;
+class WidthAwareLine implements Component {
+	renders = 0;
+	readonly widths: number[] = [];
+	readonly label: string;
 
-		constructor(id: number) {
-			this.id = id;
-		}
-		render(width: number): string[] {
-			this.renders++;
-			widths.push(width);
-			return Array.from({ length: Math.ceil(40 / width) }, () => `w${this.id}`);
-		}
-		invalidate(): void {}
+	constructor(label: string) {
+		this.label = label;
 	}
-	const container = new WindowedContainer({ getViewport: () => ({ top, height: 2 }), overscan: 0 });
-	for (let index = 0; index < 4; index++) container.append(() => new WidthAware(index));
-	assert.equal(container.render(40).length, 4);
-	assert.equal(container.render(20).length, 8);
-	assert.ok(widths.includes(20));
+
+	render(width: number): string[] {
+		this.renders++;
+		this.widths.push(width);
+		const rows = width < 30 ? 4 : 2;
+		return Array.from({ length: rows }, () => `${this.label}@${width}`);
+	}
+
+	invalidate(): void {}
+}
+
+/** Counts builds per index and keeps the component each entry mounted last. */
+class WidthFixture {
+	readonly container: WindowedContainer;
+	private readonly buildCountsByIndex = new Map<number, number>();
+	private readonly components = new Map<number, WidthAwareLine>();
+
+	constructor(count: number, options: WindowedContainerOptions) {
+		this.container = new WindowedContainer(options);
+		for (let index = 0; index < count; index++) {
+			this.container.append(() => {
+				this.buildCountsByIndex.set(index, (this.buildCountsByIndex.get(index) ?? 0) + 1);
+				const component = new WidthAwareLine(`m${index}`);
+				this.components.set(index, component);
+				return component;
+			});
+		}
+	}
+
+	buildCounts(): number[] {
+		return this.container.getEntries().map((_, index) => this.buildCountsByIndex.get(index) ?? 0);
+	}
+
+	entry(index: number): WindowedEntry {
+		return this.container.getEntries()[index]!;
+	}
+
+	widths(index: number): number[] {
+		return this.components.get(index)!.widths;
+	}
+}
+
+test("a narrower terminal measures the whole transcript again", () => {
+	const fixture = new WidthFixture(8, {
+		getViewport: () => ({ top: 0, height: 4 }),
+		overscan: 0,
+		retainLines: true,
+	});
+	fixture.container.render(40);
+	assert.deepEqual(fixture.buildCounts(), [1, 1, 1, 1, 1, 1, 1, 1]);
+
+	const lines = fixture.container.render(20);
+	// Narrower lines re-wrap into more lines, so no entry keeps the height it measured at the wide width.
+	assert.deepEqual(fixture.buildCounts(), [1, 1, 2, 2, 2, 2, 2, 2]);
+	assert.deepEqual(
+		fixture.container.getEntries().map((entry) => entry.height),
+		[4, 4, 4, 4, 4, 4, 4, 4],
+	);
+	assert.equal(fixture.container.height, 32);
+	// The entry was released at the wide width, so the component the shrink builds starts at the new width.
+	assert.deepEqual(fixture.widths(5), [20]);
+	assert.equal(lines[16], "m4@20");
+});
+
+test("a wider terminal measures the whole transcript again", () => {
+	const fixture = new WidthFixture(8, {
+		getViewport: () => ({ top: 0, height: 4 }),
+		overscan: 0,
+		retainLines: true,
+	});
+	fixture.container.render(20);
+
+	const lines = fixture.container.render(40);
+	assert.deepEqual(fixture.buildCounts(), [1, 2, 2, 2, 2, 2, 2, 2]);
+	assert.deepEqual(
+		fixture.container.getEntries().map((entry) => entry.height),
+		[2, 2, 2, 2, 2, 2, 2, 2],
+	);
+	assert.equal(fixture.container.height, 16);
+	assert.equal(lines[4], "m2@40");
+});
+
+test("lazyResize keeps history as estimates when the terminal widens", () => {
+	const fixture = new WidthFixture(8, {
+		getViewport: () => ({ top: 0, height: 4 }),
+		overscan: 0,
+		retainLines: true,
+		lazyResize: () => true,
+	});
+	fixture.container.render(20);
+
+	const lines = fixture.container.render(40);
+	// Lines that were already narrower than the terminal keep their wrapping, so only the window is measured.
+	assert.deepEqual(fixture.buildCounts(), [1, 1, 1, 1, 1, 1, 1, 1]);
+	assert.deepEqual(fixture.widths(0), [20, 40]);
+	assert.deepEqual(
+		fixture.container.getEntries().map((entry) => entry.height),
+		[2, 4, 4, 4, 4, 4, 4, 4],
+	);
+	assert.deepEqual(fixture.entry(1).lines, ["m1@20", "m1@20", "m1@20", "m1@20"]);
+	assert.equal(fixture.container.height, 30);
+	assert.deepEqual(fixture.widths(1), [20]);
+	assert.equal(lines[2], "m1@20");
+});
+
+test("lazyResize keeps history as estimates when the terminal narrows", () => {
+	const fixture = new WidthFixture(8, {
+		getViewport: () => ({ top: 0, height: 4 }),
+		overscan: 0,
+		retainLines: true,
+		lazyResize: () => true,
+	});
+	fixture.container.render(40);
+	assert.deepEqual(fixture.buildCounts(), [1, 1, 1, 1, 1, 1, 1, 1]);
+
+	const lines = fixture.container.render(20);
+	// A resize builds no component outside the window; only the two inside it render again.
+	assert.deepEqual(fixture.buildCounts(), [1, 1, 1, 1, 1, 1, 1, 1]);
+	assert.deepEqual(fixture.widths(0), [40, 20]);
+	assert.equal(fixture.entry(2).component, undefined);
+	// Heights and lines outside the window stay as estimates from the previous width.
+	assert.deepEqual(
+		fixture.container.getEntries().map((entry) => entry.height),
+		[4, 4, 2, 2, 2, 2, 2, 2],
+	);
+	assert.deepEqual(fixture.entry(2).lines, ["m2@40", "m2@40"]);
+	assert.equal(fixture.container.height, 20);
+	assert.equal(lines[0], "m0@20");
+	assert.equal(lines[8], "m2@40");
+});
+
+test("scrolling after a resize remeasures the entries that enter the window", () => {
+	let top = 0;
+	const fixture = new WidthFixture(8, {
+		getViewport: () => ({ top, height: 4 }),
+		overscan: 0,
+		retainLines: true,
+		lazyResize: () => true,
+	});
+	fixture.container.render(40);
+	fixture.container.render(20);
+
+	top = 12;
+	const lines = fixture.container.render(20);
+	// The two entries the window reaches now are rebuilt and measured at the new width.
+	assert.deepEqual(fixture.buildCounts(), [1, 1, 1, 1, 2, 2, 1, 1]);
+	assert.deepEqual(
+		fixture.container.getEntries().map((entry) => entry.height),
+		[4, 4, 2, 2, 4, 4, 2, 2],
+	);
+	assert.deepEqual(fixture.widths(4), [20]);
+	assert.equal(fixture.container.height, 24);
+	assert.equal(lines[12], "m4@20");
+});
+
+test("windowFromEnd remeasures only the tail window when lazy", () => {
+	const fixture = new WidthFixture(10, {
+		windowFromEnd: true,
+		getViewportLines: () => 4,
+		overscan: 0,
+		lazyResize: () => true,
+	});
+	fixture.container.render(20);
+
+	const lines = fixture.container.render(40);
+	assert.deepEqual(fixture.buildCounts(), [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]);
+	assert.deepEqual(fixture.widths(8), [20]);
+	assert.deepEqual(fixture.widths(9), [20, 40]);
+	// Nine entries keep their measured 4 lines; only the one in the tail window shrinks to 2.
+	assert.equal(fixture.container.height, 9 * 4 + 2);
+	assert.equal(lines.length, 38);
 });
 
 test("invalidate drops heights and re-renders live components", () => {

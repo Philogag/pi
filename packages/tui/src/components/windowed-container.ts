@@ -35,6 +35,13 @@ export interface WindowedContainerOptions {
 	 * entries to empty lines and is only safe when nothing reads the buffer outside the visible window.
 	 */
 	retainLines?: boolean | (() => boolean);
+	/**
+	 * Keep the heights measured at the previous width as the layout estimate when the width changes, and
+	 * remeasure entries as the window reaches them. Only safe when the renderer clips lines on write: a
+	 * renderer that writes them makes the terminal wrap lines of the wrong width and lose track of its own
+	 * lines. Default: measure the whole transcript again on every width change.
+	 */
+	lazyResize?: () => boolean;
 	/** Called with the component an entry released when it left the window. */
 	onEvict?: (component: Component, entry: WindowedEntry) => void;
 }
@@ -49,7 +56,7 @@ export interface WindowedEntry {
 	lines?: string[];
 	/** Entry never leaves the window. Streaming rows and rows without a build stay pinned. */
 	pinned: boolean;
-	/** Line height measured at the container width; `-1` until measured. */
+	/** Line height measured at the container width, or the height of an earlier width until remeasured. */
 	height: number;
 	/** First content line of the entry. */
 	start: number;
@@ -72,6 +79,11 @@ function disposeComponent(component: Component): void {
  * Entries outside the window release their component (and its caches) and collapse to their measured
  * height, so a long transcript costs a line count per message instead of a live component tree.
  * `build` recreates the component when the entry scrolls back into the window.
+ *
+ * By default a width change measures the whole transcript again. With `lazyResize` the window is measured
+ * first: entries outside it keep the height measured at the previous width as the layout estimate and their
+ * retained lines, and are remeasured when the window reaches them, so a resize costs O(window) instead of
+ * O(transcript) and content above the window keeps its wrapping until it is scrolled back in.
  */
 export class WindowedContainer extends Container {
 	private readonly entries: WindowedEntry[] = [];
@@ -79,6 +91,7 @@ export class WindowedContainer extends Container {
 	private readonly getViewportLinesOption?: () => number;
 	private readonly onEvictOption?: (component: Component, entry: WindowedEntry) => void;
 	private readonly overscan: number;
+	private readonly lazyResizeOption?: () => boolean;
 	private readonly retainLinesOption: boolean | (() => boolean);
 	private readonly windowFromEnd: boolean;
 	private measuredWidth = -1;
@@ -89,6 +102,7 @@ export class WindowedContainer extends Container {
 		this.getViewportOption = options.getViewport;
 		this.getViewportLinesOption = options.getViewportLines;
 		this.onEvictOption = options.onEvict;
+		this.lazyResizeOption = options.lazyResize;
 		this.windowFromEnd = options.windowFromEnd === true;
 		this.overscan = Math.max(0, Math.floor(options.overscan ?? 1));
 		this.retainLinesOption = options.retainLines ?? false;
@@ -192,11 +206,10 @@ export class WindowedContainer extends Container {
 	override render(width: number): string[] {
 		const safeWidth = Math.max(1, Math.floor(width));
 		if (safeWidth !== this.measuredWidth) {
+			// A lazy renderer keeps the heights measured at the previous width as layout estimates, so the next
+			// frame still knows where every entry is without remeasuring the transcript.
+			if (!(this.lazyResizeOption?.() ?? false)) this.dropRetainedLines();
 			this.measuredWidth = safeWidth;
-			for (const entry of this.entries) {
-				entry.lines = undefined;
-				entry.height = -1;
-			}
 		}
 
 		// Positions from the previous frame decide what to build, so evicted entries are not rebuilt just to measure.
@@ -255,6 +268,16 @@ export class WindowedContainer extends Container {
 			if (entry.height >= 0 && line >= entry.start && line < entry.start + entry.height) return entry;
 		}
 		return undefined;
+	}
+
+	/**
+	 * Withdraws every rendered line so the whole transcript is measured again at the new width.
+	 */
+	private dropRetainedLines(): void {
+		for (const entry of this.entries) {
+			entry.lines = undefined;
+			entry.height = -1;
+		}
 	}
 
 	private indexOfEntry(component: Component): number {

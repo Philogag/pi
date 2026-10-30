@@ -2,10 +2,14 @@
  * Long-session scroll and interaction benchmark.
  *
  * Resumes a real session in the built coding agent (inside a throwaway tmux pty),
- * drives scrolling, mouse wheel, typing and the working indicator with keystrokes,
- * and samples the pi process from /proc: CPU time, RSS, and bytes written to the
- * terminal (`wchar`). Answers "does an interaction cost scale with the transcript
- * or with the viewport" on a session you actually use.
+ * drives scrolling, mouse wheel, typing, the working indicator and window resizes
+ * with keystrokes, and samples the pi process from /proc: CPU time, RSS, and bytes
+ * written to the terminal (`wchar`). Answers "does an interaction cost scale with
+ * the transcript or with the viewport" on a session you actually use.
+ *
+ * `--phases` picks what to drive; it defaults to all phases.
+ *   --phases resize            # resize cost only, a few seconds per run
+ *   --phases scroll,typing     # everything except the spinner and resizes
  *
  * Requirements: Linux (/proc), tmux, and a built tree (`npm run build`).
  *
@@ -30,6 +34,9 @@ import { fileURLToPath } from "node:url";
 
 const COLUMNS = 120;
 const ROWS = 40;
+const RESIZE_COLUMNS = 100;
+const RESIZE_ROWS = 34;
+const RESIZE_CYCLES = 3;
 const SUSTAINED_PAGES = 60;
 const WHEEL_EVENTS = 100;
 const TYPED_CHARS = 60;
@@ -42,13 +49,14 @@ const WHEEL_GAP_MS = 25;
 const TYPE_GAP_MS = 40;
 const SETTLE_MS = 1200;
 const TYPED_TEXT = "abcdefghij";
+const ALL_PHASES = ["scroll", "typing", "spinner", "resize"];
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const socket = `pi-bench-${process.pid}`;
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 
 function parseArgs(argv) {
-	const options = { mode: "fullscreen", runs: 1, pages: 20, json: false };
+	const options = { mode: "fullscreen", runs: 1, pages: 20, json: false, phases: new Set(ALL_PHASES) };
 	for (let index = 0; index < argv.length; index++) {
 		const arg = argv[index];
 		if (arg === "--json") {
@@ -60,13 +68,19 @@ function parseArgs(argv) {
 			continue;
 		}
 		const value = argv[index + 1];
-		if (!["--session", "--tree", "--compare-tree", "--mode", "--runs", "--pages"].includes(arg)) {
+		if (!["--session", "--tree", "--compare-tree", "--mode", "--runs", "--pages", "--phases"].includes(arg)) {
 			throw new Error(`Unknown option: ${arg}`);
 		}
 		if (value === undefined) throw new Error(`Missing value for ${arg}`);
 		index++;
 		const key = arg.slice(2).replaceAll(/-([a-z])/g, (_, letter) => letter.toUpperCase());
-		if (arg === "--runs" || arg === "--pages") options[key] = Number.parseInt(value, 10);
+		if (arg === "--phases") {
+			options.phases = new Set();
+			for (const phase of value.split(",")) {
+				if (!ALL_PHASES.includes(phase)) throw new Error(`Unknown phase: ${phase} (${ALL_PHASES.join(", ")})`);
+				options.phases.add(phase);
+			}
+		} else if (arg === "--runs" || arg === "--pages") options[key] = Number.parseInt(value, 10);
 		else options[key] = value;
 	}
 	return options;
@@ -103,7 +117,7 @@ async function main() {
 	}
 	const summary = sanitizeRounds(rounds, trees);
 	for (const tree of trees) printTable(`${tree.label} (${tree.dir})`, summary[tree.label]);
-	if (trees.length === 2) printDelta(trees[0], trees[1], medianMetrics(summary[trees[0].label]), medianMetrics(summary[trees[1].label]));
+	if (trees.length === 2) printDelta(trees[0], trees[1], metricRows(summary[trees[0].label]), metricRows(summary[trees[1].label]));
 }
 
 function requireLinux() {
@@ -216,6 +230,64 @@ async function window(pid, durationMs) {
 	};
 }
 
+/** Waits until the process stops consuming CPU, so one resize's cost is not mixed into the next. */
+async function waitForIdle(pid) {
+	let previous = sample(pid);
+	const deadline = Date.now() + 30_000;
+	while (Date.now() < deadline) {
+		await sleep(100);
+		const current = sample(pid);
+		if (!current) return;
+		const rate = (current.cpuSec - previous.cpuSec) / ((current.at - previous.at) / 1000);
+		if (rate >= 0.05) {
+			previous = current;
+			continue;
+		}
+		await sleep(400);
+		const settled = sample(pid);
+		if (settled && (settled.cpuSec - current.cpuSec) / ((settled.at - current.at) / 1000) < 0.05) return;
+		previous = settled ?? current;
+	}
+}
+
+/** Median CPU and bytes per resize event, alternating between two terminal sizes. */
+async function resizeBurst(pid, cycles) {
+	const events = [];
+	for (let cycle = 0; cycle < cycles; cycle++) {
+		for (const size of [
+			{ columns: RESIZE_COLUMNS, rows: RESIZE_ROWS },
+			{ columns: COLUMNS, rows: ROWS },
+		]) {
+			const before = sample(pid);
+			tmux("resize-window", "-t", "bench", "-x", String(size.columns), "-y", String(size.rows));
+			await waitForIdle(pid);
+			const after = sample(pid);
+			events.push({
+				cpuSec: after.cpuSec - before.cpuSec,
+				bytes: Math.max(0, after.bytes - before.bytes),
+				columns: size.columns,
+			});
+		}
+	}
+	const final = sample(pid);
+	const cpuSec = events.reduce((total, event) => total + event.cpuSec, 0);
+	const bytes = events.reduce((total, event) => total + event.bytes, 0);
+	// The two directions cost different things: narrowing re-wraps the transcript, widening does not.
+	const shrink = events.filter((event) => event.columns === RESIZE_COLUMNS);
+	const grow = events.filter((event) => event.columns === COLUMNS);
+	return {
+		events: events.length,
+		cpuSec: round(cpuSec, 3),
+		cpuMsShrink: round(median(shrink.map((event) => event.cpuSec * 1000)), 2),
+		cpuMsGrow: round(median(grow.map((event) => event.cpuSec * 1000)), 2),
+		bytesShrink: Math.round(median(shrink.map((event) => event.bytes))),
+		bytesGrow: Math.round(median(grow.map((event) => event.bytes))),
+		bytes,
+		rssMb: round(final.rssMb, 1),
+		peakMb: round(final.peakMb, 1),
+	};
+}
+
 async function measureTree(tree, options, run) {
 	killServer();
 	const command = [
@@ -236,33 +308,44 @@ async function measureTree(tree, options, run) {
 	try {
 		const ready = await waitForReady(pid, startedAt);
 		const painted = tmuxQuiet("capture-pane", "-p", "-t", "bench").split("\n").filter((line) => line.trim()).length;
+		const phases = options.phases;
 
-		// Warm the scroll path once so the first measured page is not a cold materialization.
-		await burst(pid, Array(3).fill("PPage"), 60);
-		await burst(pid, Array(3).fill("NPage"), 60);
-
-		const pages = Array(options.pages).fill("PPage");
-		const pageUp = await burst(pid, pages, KEY_GAP_MS);
-		const pageDown = await burst(pid, Array(options.pages).fill("NPage"), KEY_GAP_MS);
-		const sustained = await burst(pid, Array(SUSTAINED_PAGES).fill("PPage"), 40);
-		await burst(pid, Array(SUSTAINED_PAGES).fill("NPage"), 40);
-		const wheelUp = await burst(pid, Array(WHEEL_EVENTS).fill(WHEEL_UP), WHEEL_GAP_MS);
-		const wheelDown = await burst(pid, Array(WHEEL_EVENTS).fill(WHEEL_DOWN), WHEEL_GAP_MS);
-		const typing = await burst(
-			pid,
-			Array.from({ length: TYPED_CHARS }, (_, index) => TYPED_TEXT[index % TYPED_TEXT.length]),
-			TYPE_GAP_MS,
-		);
-		await burst(pid, Array(TYPED_CHARS + 4).fill("BSpace"), 25);
-
-		// Working indicator: a bash execution keeps the spinner rendering.
-		tmux("send-keys", "-t", "bench", "-l", `!sleep ${(SPINNER_WINDOWS * SPINNER_WINDOW_MS) / 1000 + 4}`);
-		tmux("send-keys", "-t", "bench", "Enter");
-		await sleep(1500);
+		let pageUp, pageDown, sustained, wheelUp, wheelDown, typing, resize;
 		const spinner = [];
-		for (let index = 0; index < SPINNER_WINDOWS; index++) spinner.push(await window(pid, SPINNER_WINDOW_MS));
+		if (phases.has("scroll")) {
+			// Warm the scroll path once so the first measured page is not a cold materialization.
+			await burst(pid, Array(3).fill("PPage"), 60);
+			await burst(pid, Array(3).fill("NPage"), 60);
+
+			const pages = Array(options.pages).fill("PPage");
+			pageUp = await burst(pid, pages, KEY_GAP_MS);
+			pageDown = await burst(pid, Array(options.pages).fill("NPage"), KEY_GAP_MS);
+			sustained = await burst(pid, Array(SUSTAINED_PAGES).fill("PPage"), 40);
+			await burst(pid, Array(SUSTAINED_PAGES).fill("NPage"), 40);
+			wheelUp = await burst(pid, Array(WHEEL_EVENTS).fill(WHEEL_UP), WHEEL_GAP_MS);
+			wheelDown = await burst(pid, Array(WHEEL_EVENTS).fill(WHEEL_DOWN), WHEEL_GAP_MS);
+		}
+		if (phases.has("typing")) {
+			typing = await burst(
+				pid,
+				Array.from({ length: TYPED_CHARS }, (_, index) => TYPED_TEXT[index % TYPED_TEXT.length]),
+				TYPE_GAP_MS,
+			);
+			await burst(pid, Array(TYPED_CHARS + 4).fill("BSpace"), 25);
+		}
+		if (phases.has("spinner")) {
+			// Working indicator: a bash execution keeps the spinner rendering.
+			tmux("send-keys", "-t", "bench", "-l", `!sleep ${(SPINNER_WINDOWS * SPINNER_WINDOW_MS) / 1000 + 4}`);
+			tmux("send-keys", "-t", "bench", "Enter");
+			await sleep(1500);
+			for (let index = 0; index < SPINNER_WINDOWS; index++) spinner.push(await window(pid, SPINNER_WINDOW_MS));
+			// Let the bash command report before the next phase, so its output does not land inside it.
+			await sleep(3000);
+		}
+		if (phases.has("resize")) resize = await resizeBurst(pid, RESIZE_CYCLES);
 
 		const final = sample(pid);
+		const interacted = phases.has("scroll") || phases.has("typing") || phases.has("spinner");
 		return {
 			label: tree.label,
 			dir: tree.dir,
@@ -281,11 +364,14 @@ async function measureTree(tree, options, run) {
 			wheelDown,
 			typing,
 			spinner,
-			totals: {
-				cpuSec: round(final.cpuSec - ready.cpuSec, 3),
-				rssMb: round(final.rssMb, 1),
-				peakMb: round(final.peakMb, 1),
-			},
+			resize,
+			totals: interacted
+				? {
+						cpuSec: round(final.cpuSec - ready.cpuSec, 3),
+						rssMb: round(final.rssMb, 1),
+						peakMb: round(final.peakMb, 1),
+					}
+				: undefined,
 		};
 	} finally {
 		killServer();
@@ -306,14 +392,22 @@ const metrics = [
 	{ label: "cold load wall (s)", pick: (round) => round.load.wallMs / 1000 },
 	{ label: "cold load CPU (s)", pick: (round) => round.load.cpuSec },
 	{ label: "cold load RSS (MB)", pick: (round) => round.load.rssMb },
-	{ label: "page-up CPU / key (ms)", pick: (round) => round.pageUp.cpuMsPerEvent },
-	{ label: "page-down CPU / key (ms)", pick: (round) => round.pageDown.cpuMsPerEvent },
-	{ label: "sustained scroll CPU / key (ms)", pick: (round) => round.sustained.cpuMsPerEvent },
-	{ label: "mouse-wheel CPU / event (ms)", pick: (round) => round.wheelUp.cpuMsPerEvent },
-	{ label: "typing CPU / keystroke (ms)", pick: (round) => round.typing.cpuMsPerEvent },
-	{ label: "spinner CPU (% of one core)", pick: (round) => median(round.spinner.slice(1).map((item) => item.corePct)) },
-	{ label: "RSS after interaction (MB)", pick: (round) => round.totals.rssMb },
-	{ label: "peak RSS (MB)", pick: (round) => round.totals.peakMb },
+	{ label: "page-up CPU / key (ms)", pick: (round) => round.pageUp?.cpuMsPerEvent },
+	{ label: "page-down CPU / key (ms)", pick: (round) => round.pageDown?.cpuMsPerEvent },
+	{ label: "sustained scroll CPU / key (ms)", pick: (round) => round.sustained?.cpuMsPerEvent },
+	{ label: "mouse-wheel CPU / event (ms)", pick: (round) => round.wheelUp?.cpuMsPerEvent },
+	{ label: "typing CPU / keystroke (ms)", pick: (round) => round.typing?.cpuMsPerEvent },
+	{
+		label: "spinner CPU (% of one core)",
+		pick: (round) => (round.spinner.length === 0 ? undefined : median(round.spinner.slice(1).map((item) => item.corePct))),
+	},
+	{ label: "resize CPU shrink (ms)", pick: (round) => round.resize?.cpuMsShrink },
+	{ label: "resize CPU grow (ms)", pick: (round) => round.resize?.cpuMsGrow },
+	{ label: "resize bytes shrink", pick: (round) => round.resize?.bytesShrink },
+	{ label: "resize bytes grow", pick: (round) => round.resize?.bytesGrow },
+	{ label: "RSS after resize (MB)", pick: (round) => round.resize?.rssMb },
+	{ label: "RSS after interaction (MB)", pick: (round) => round.totals?.rssMb },
+	{ label: "peak RSS (MB)", pick: (round) => round.totals?.peakMb },
 ];
 
 function sanitizeRounds(rounds, trees) {
@@ -322,28 +416,34 @@ function sanitizeRounds(rounds, trees) {
 	return summary;
 }
 
-function medianMetrics(rounds) {
-	return metrics.map((metric) => ({ label: metric.label, value: median(rounds.map((round) => metric.pick(round))) }));
+/** Metrics present in these rounds, so a skipped phase prints no row. */
+function metricRows(rounds) {
+	const rows = [];
+	for (const metric of metrics) {
+		const values = rounds.map((round) => metric.pick(round)).filter((value) => value !== undefined);
+		if (values.length === 0) continue;
+		rows.push({ label: metric.label, value: median(values) });
+	}
+	return rows;
 }
 
 function printTable(title, rounds) {
-	const width = Math.max(...metrics.map((metric) => metric.label.length));
-	const values = metrics.map((metric) => median(rounds.map((round) => metric.pick(round))));
+	const rows = metricRows(rounds);
+	const width = Math.max(...rows.map((row) => row.label.length));
 	process.stdout.write(`\n${title}  (${rounds.length} run${rounds.length === 1 ? "" : "s"})\n`);
-	metrics.forEach((metric, index) => {
-		process.stdout.write(`  ${metric.label.padEnd(width)}  ${format(values[index])}\n`);
-	});
+	for (const row of rows) process.stdout.write(`  ${row.label.padEnd(width)}  ${format(row.value)}\n`);
 }
 
 function printDelta(baseTree, compareTree, base, compare) {
-	const width = Math.max(...base.map((metric) => metric.label.length));
+	const rows = base.filter((row) => compare.some((candidate) => candidate.label === row.label));
+	const width = Math.max(...rows.map((row) => row.label.length));
 	process.stdout.write(`\n${compareTree.label} relative to ${baseTree.label} (negative is cheaper than ${baseTree.label})\n`);
-	base.forEach((metric, index) => {
-		const left = metric.value;
-		const right = compare[index].value;
+	for (const row of rows) {
+		const left = row.value;
+		const right = compare.find((candidate) => candidate.label === row.label).value;
 		const percent = left === 0 ? "n/a" : `${(((right - left) / left) * 100).toFixed(0)}%`;
-		process.stdout.write(`  ${metric.label.padEnd(width)}  ${format(left)}  ${format(right)}  ${percent}\n`);
-	});
+		process.stdout.write(`  ${row.label.padEnd(width)}  ${format(left)}  ${format(right)}  ${percent}\n`);
+	}
 }
 
 function format(value) {

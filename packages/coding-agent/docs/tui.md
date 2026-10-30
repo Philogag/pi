@@ -185,7 +185,7 @@ Long transcripts use `WindowedContainer` for the chat area: each message is an e
 
 Use `PI_TUI_WRITE_LOG` to capture the raw ANSI stream when diagnosing rendering problems. Test narrow widths, wide characters, resize events, theme changes, focus transitions, and both regular and fullscreen modes.
 
-Use `npm run bench:session -- --session <file>` to see how scroll, mouse wheel, typing and the working indicator scale with transcript size; `--compare-tree` prints the same metrics for a second built tree and their delta.
+Use `npm run bench:session -- --session <file>` to see how scroll, mouse wheel, typing, the working indicator and window resizes scale with transcript size; `--compare-tree` prints the same metrics for a second built tree and their delta, and `--phases resize` narrows a run to resize cost alone.
 
 ## Examples and source
 
